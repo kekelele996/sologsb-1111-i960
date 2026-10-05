@@ -29,3 +29,8 @@ a {
 .conflict-row > td {
   background: #fff1f0 !important;
 }
+
+/* 移交单对账：照本台保留的差异行轻微置灰 */
+.handover-skip-row > td {
+  background: #fafafa;
+}

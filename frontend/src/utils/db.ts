@@ -3,12 +3,13 @@ import type { DrillHole } from '../types/drill-hole';
 import type { DrillRun } from '../types/drill-run';
 import type { CoreBox } from '../types/core-box';
 import type { LithoLog } from '../types/litho-log';
+import type { HandoverBatch } from '../types/handover';
 
 /** IndexedDB 库名（浏览器本地存储，无后端） */
 export const DB_NAME = 'gbdrillcore-db';
 
 /** 当前 schema 版本，与 db.version(n) 对应 */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 class DrillCoreDB extends Dexie {
   holes!: Table<DrillHole, string>;
@@ -16,6 +17,8 @@ class DrillCoreDB extends Dexie {
   boxes!: Table<CoreBox, string>;
   lithos!: Table<LithoLog, string>;
   meta!: Table<{ key: string; value: string }, string>;
+  /** 库管员移交单导入批次（支持整体撤回） */
+  transfers!: Table<HandoverBatch, string>;
 
   constructor() {
     super(DB_NAME);
@@ -47,6 +50,28 @@ class DrillCoreDB extends Dexie {
             if (typeof row.rqd !== 'number') {
               row.rqd = 0;
             }
+          });
+      });
+
+    // v3：岩芯箱增加入架状态（rackStatus）与入架时间（rackedAt），新增移交单导入批次表 transfers。
+    // 历史箱子一律按「未入架」显示，货架位保留编录员预排值；入架以库管员移交单导入为准。
+    // 升级前请在顶栏「导出备份」导出 JSON。
+    this.version(3)
+      .stores({
+        holes: 'id, holeNo, rigNo, shift, startDate',
+        runs: 'id, runNo, holeId, fromDepth, toDepth, shift',
+        boxes: 'id, boxNo, holeId, shelfPos, boxedAt, rackStatus',
+        lithos: 'id, holeId, fromDepth, toDepth, [holeId+fromDepth], lithology',
+        meta: 'key',
+        transfers: 'id, importedAt',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('boxes')
+          .toCollection()
+          .modify((box: CoreBox) => {
+            box.rackStatus = 'unracked';
+            delete box.rackedAt;
           });
       });
   }

@@ -1,3 +1,6 @@
+/** 入架状态：未入架 / 已入架（以库管员移交单导入为准） */
+export type RackStatus = 'unracked' | 'racked';
+
 /** 岩芯箱 */
 export interface CoreBox {
   id: string;
@@ -15,8 +18,12 @@ export interface CoreBox {
   slotLength: number;
   /** 装箱日期 ISO */
   boxedAt: string;
-  /** 库架位 */
+  /** 库架位（编录员预排，可留空待补；入架后以库管移交单为准） */
   shelfPos: string;
+  /** 入架状态，历史数据升级后一律为未入架 */
+  rackStatus: RackStatus;
+  /** 入架时间 ISO（取自库管员移交单），未入架时为空 */
+  rackedAt?: string;
   /** 破损格（格序号，从 1 开始） */
   damagedSlots: number[];
   /** 装箱人 */
