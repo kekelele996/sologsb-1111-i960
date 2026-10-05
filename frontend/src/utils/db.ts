@@ -8,7 +8,7 @@ import type { LithoLog } from '../types/litho-log';
 export const DB_NAME = 'gbdrillcore-db';
 
 /** 当前 schema 版本，与 db.version(n) 对应 */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 class DrillCoreDB extends Dexie {
   holes!: Table<DrillHole, string>;
@@ -47,6 +47,26 @@ class DrillCoreDB extends Dexie {
             if (typeof row.rqd !== 'number') {
               row.rqd = 0;
             }
+          });
+      });
+
+    // v3：岩芯箱增加入架状态 shelfStatus 与入架时间 shelvedAt。
+    // 已有数据一律按「未入架」显示（有货架位不等于已入架，需凭库管员移交单核对入架）。
+    this.version(3)
+      .stores({
+        holes: 'id, holeNo, rigNo, shift, startDate',
+        runs: 'id, runNo, holeId, fromDepth, toDepth, shift',
+        boxes: 'id, boxNo, holeId, shelfPos, boxedAt, shelfStatus',
+        lithos: 'id, holeId, fromDepth, toDepth, [holeId+fromDepth], lithology',
+        meta: 'key',
+      })
+      .upgrade(async (tx) => {
+        await tx
+          .table('boxes')
+          .toCollection()
+          .modify((row: CoreBox) => {
+            row.shelfStatus = 'unshelved';
+            row.shelvedAt = undefined;
           });
       });
   }

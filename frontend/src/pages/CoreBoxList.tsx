@@ -1,6 +1,25 @@
 import { useMemo, useState } from 'react';
-import { Alert, App as AntApp, Button, Card, DatePicker, Form, Input, InputNumber, Modal, Popconfirm, Row, Col, Select, Space, Table, Tag, Typography } from 'antd';
+import {
+  Alert,
+  App as AntApp,
+  Button,
+  Card,
+  DatePicker,
+  Form,
+  Input,
+  InputNumber,
+  Modal,
+  Popconfirm,
+  Row,
+  Col,
+  Select,
+  Space,
+  Table,
+  Tag,
+  Typography,
+} from 'antd';
 import type { TableColumnsType } from 'antd';
+import { ImportOutlined, RollbackOutlined } from '@ant-design/icons';
 import dayjs, { type Dayjs } from 'dayjs';
 import BoxGrid from '../components/common/BoxGrid';
 import DepthRangeInput from '../components/common/DepthRangeInput';
@@ -8,8 +27,17 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import { useHoleStore } from '../stores/holeStore';
 import { useRunStore } from '../stores/runStore';
 import { useBoxStore } from '../stores/boxStore';
-import { SHELF_POSITIONS, type CoreBox, type BoxContinuity } from '../types/core-box';
+import {
+  SHELF_POSITIONS,
+  SHELF_STATUS_TEXT,
+  RECONCILE_ISSUE_TEXT,
+  type CoreBox,
+  type BoxContinuity,
+  type ShelfStatus,
+  type ReconcileResult,
+} from '../types/core-box';
 import { boxCapacityOk, checkBoxContinuity, validateRange } from '../utils/recovery';
+import { HANDOVER_EXAMPLE, parseHandover, reconcileHandover } from '../utils/handover';
 
 const { Title, Paragraph, Text } = Typography;
 
@@ -39,9 +67,9 @@ function parseSlots(text: string | undefined): number[] {
   ).sort((a, b) => a - b);
 }
 
-/** 岩芯箱编目与格位分配：校验深度连续性 */
+/** 岩芯箱编目与格位分配：校验深度连续性，导入库管员移交单并按箱号核对入架 */
 export default function CoreBoxList() {
-  const { message } = AntApp.useApp();
+  const { message, modal } = AntApp.useApp();
   const holes = useHoleStore((s) => s.holes);
   const currentHoleId = useHoleStore((s) => s.currentHoleId);
   const setCurrentHole = useHoleStore((s) => s.setCurrentHole);
@@ -51,6 +79,13 @@ export default function CoreBoxList() {
   const updateBox = useBoxStore((s) => s.updateBox);
   const removeBox = useBoxStore((s) => s.removeBox);
   const toggleDamagedSlot = useBoxStore((s) => s.toggleDamagedSlot);
+  const importHandover = useBoxStore((s) => s.importHandover);
+  const rollbackHandover = useBoxStore((s) => s.rollbackHandover);
+  const dismissRollback = useBoxStore((s) => s.dismissRollback);
+  const markShelved = useBoxStore((s) => s.markShelved);
+  const markUnshelved = useBoxStore((s) => s.markUnshelved);
+  const canRollback = useBoxStore((s) => s.canRollback);
+  const lastImportSummary = useBoxStore((s) => s.lastImportSummary);
 
   const [form] = Form.useForm<BoxFormValues>();
   const [open, setOpen] = useState(false);
@@ -58,6 +93,16 @@ export default function CoreBoxList() {
   const [selectedBoxId, setSelectedBoxId] = useState('');
   /** 深度区间以本地 state 为唯一数据源（Form.useWatch 在弹窗挂载前可能读不到值） */
   const [range, setRange] = useState<{ from: number; to: number }>({ from: 0, to: 0 });
+
+  // 移交单导入
+  const [importOpen, setImportOpen] = useState(false);
+  const [importText, setImportText] = useState('');
+  const [importResult, setImportResult] = useState<ReconcileResult | null>(null);
+  const [importing, setImporting] = useState(false);
+
+  // 手动标记入架
+  const [shelveTarget, setShelveTarget] = useState<CoreBox | null>(null);
+  const [shelveDate, setShelveDate] = useState<Dayjs>(dayjs());
 
   const holeOptions = holes.map((hole) => ({ label: `${hole.holeNo} · ${hole.rigNo}`, value: hole.id }));
   const activeHoleId = currentHoleId || holes[0]?.id || '';
@@ -68,6 +113,9 @@ export default function CoreBoxList() {
   );
 
   const continuityOf = (box: CoreBox): BoxContinuity => checkBoxContinuity(box, runs);
+
+  /** 缺货架位的岩芯箱（提示补齐） */
+  const missingShelfBoxes = useMemo(() => boxes.filter((b) => !b.shelfPos), [boxes]);
 
   const openCreate = () => {
     setEditing(null);
@@ -130,7 +178,7 @@ export default function CoreBoxList() {
       damagedSlots: parseSlots(values.damagedText).filter((slot) => slot <= (Number(values.slots) || 0)),
       remark: values.remark,
     };
-    const draft: CoreBox = { id: editing?.id ?? 'draft', ...payload };
+    const draft: CoreBox = { id: editing?.id ?? 'draft', shelfStatus: 'unshelved', ...payload };
     if (!boxCapacityOk(draft)) {
       message.error('格数 × 每格长度小于区间长度，格位容量不足');
       return;
@@ -150,12 +198,114 @@ export default function CoreBoxList() {
     setOpen(false);
   };
 
+  // ---- 移交单导入 ----
+  const openImport = () => {
+    setImportText('');
+    setImportResult(null);
+    setImportOpen(true);
+  };
+
+  const handleReconcile = () => {
+    try {
+      const form = parseHandover(importText);
+      if (form.items.length === 0) {
+        message.warning('移交单未解析出明细');
+        return;
+      }
+      const result = reconcileHandover(form, boxes);
+      setImportResult(result);
+      if (result.updates.length === 0) {
+        message.warning('没有可应用的更新，所有差异项均保留本台');
+      } else {
+        message.success(`核对完成：可应用 ${result.updates.length} 条，差异 ${result.issues.length} 条`);
+      }
+    } catch (error) {
+      message.error(`解析失败：${(error as Error).message}`);
+    }
+  };
+
+  const handleConfirmImport = async () => {
+    if (!importResult || importResult.updates.length === 0) return;
+    setImporting(true);
+    try {
+      const form = parseHandover(importText);
+      const { summary } = await importHandover(form);
+      message.success(`已导入 ${summary.applied} 条入架信息，可在顶部「撤回导入」整体撤回`);
+      setImportOpen(false);
+      setImportResult(null);
+    } catch (error) {
+      message.error(`导入失败：${(error as Error).message}`);
+    } finally {
+      setImporting(false);
+    }
+  };
+
+  const handleRollback = () => {
+    modal.confirm({
+      title: '撤回本次导入？',
+      content: '将恢复导入前的货架位与入架状态，本次导入应用的入架信息将全部撤回。',
+      okText: '撤回',
+      okButtonProps: { danger: true },
+      cancelText: '取消',
+      onOk: async () => {
+        const ok = await rollbackHandover();
+        if (ok) {
+          message.success('已撤回本次导入，恢复到导入前状态');
+        } else {
+          message.warning('没有可撤回的导入快照');
+        }
+      },
+    });
+  };
+
+  // ---- 手动标记入架 ----
+  const openShelve = (box: CoreBox) => {
+    setShelveTarget(box);
+    setShelveDate(dayjs());
+  };
+
+  const confirmShelve = async () => {
+    if (!shelveTarget) return;
+    await markShelved(shelveTarget.id, shelveDate.toISOString());
+    message.success(`已标记 ${shelveTarget.boxNo} 入架`);
+    setShelveTarget(null);
+  };
+
   const columns: TableColumnsType<CoreBox> = [
     { title: '箱号', dataIndex: 'boxNo', width: 130, render: (v: string) => <Text strong>{v}</Text> },
     { title: '深度区间(m)', width: 130, render: (_, row) => `${row.fromDepth}~${row.toDepth}` },
     { title: '格数', dataIndex: 'slots', width: 70, align: 'right' },
     { title: '每格长度(m)', dataIndex: 'slotLength', width: 110, align: 'right' },
-    { title: '库架位', dataIndex: 'shelfPos', width: 110 },
+    {
+      title: '库架位',
+      dataIndex: 'shelfPos',
+      width: 140,
+      render: (v: string, row) =>
+        v ? (
+          <Text>{v}</Text>
+        ) : (
+          <Select
+            size="small"
+            style={{ width: 130 }}
+            placeholder="缺货架位"
+            status="warning"
+            options={SHELF_POSITIONS.map((p) => ({ label: p, value: p }))}
+            onChange={(val) => updateBox(row.id, { shelfPos: val })}
+          />
+        ),
+    },
+    {
+      title: '入架状态',
+      dataIndex: 'shelfStatus',
+      width: 90,
+      render: (v: ShelfStatus) => (v === 'shelved' ? <Tag color="green">{SHELF_STATUS_TEXT.shelved}</Tag> : <Tag>{SHELF_STATUS_TEXT.unshelved}</Tag>),
+    },
+    {
+      title: '入架时间',
+      dataIndex: 'shelvedAt',
+      width: 110,
+      render: (v?: string) => (v ? dayjs(v).format('YYYY-MM-DD') : <Text type="secondary">—</Text>),
+    },
     { title: '装箱日期', dataIndex: 'boxedAt', width: 110, render: (v: string) => dayjs(v).format('YYYY-MM-DD') },
     { title: '装箱人', dataIndex: 'operator', width: 90 },
     {
@@ -177,7 +327,7 @@ export default function CoreBoxList() {
     },
     {
       title: '操作',
-      width: 200,
+      width: 240,
       fixed: 'right',
       render: (_, record) => (
         <Space size={2}>
@@ -187,6 +337,17 @@ export default function CoreBoxList() {
           <Button size="small" type="link" onClick={() => openEdit(record)}>
             编辑
           </Button>
+          {record.shelfStatus === 'shelved' ? (
+            <Popconfirm title={`确认 ${record.boxNo} 撤架（恢复未入架）？`} onConfirm={() => markUnshelved(record.id).then(() => message.success('已撤架'))}>
+              <Button size="small" type="link">
+                撤架
+              </Button>
+            </Popconfirm>
+          ) : (
+            <Button size="small" type="link" onClick={() => openShelve(record)}>
+              标记入架
+            </Button>
+          )}
           <Popconfirm title={`确认删除岩芯箱 ${record.boxNo}？`} onConfirm={() => removeBox(record.id).then(() => message.success('已删除'))}>
             <Button size="small" type="link" danger>
               删除
@@ -204,7 +365,45 @@ export default function CoreBoxList() {
       <Title level={3} style={{ marginBottom: 4 }}>
         岩芯箱编目与格位分配
       </Title>
-      <Paragraph type="secondary">按深度区间分配格位，装箱时校验区间与回次是否连续；断档在格位网格中以虚线标出，破损格可点击切换标记。</Paragraph>
+      <Paragraph type="secondary">
+        按深度区间分配格位，装箱时校验区间与回次是否连续；断档在格位网格中以虚线标出，破损格可点击切换标记。库管员移交单可导入核对入架，差异保留本台并可整体撤回。
+      </Paragraph>
+
+      {canRollback && lastImportSummary ? (
+        <Alert
+          style={{ marginBottom: 12 }}
+          type="info"
+          showIcon
+          message={`本次导入已应用 ${lastImportSummary.applied} 条入架信息${lastImportSummary.handoverNo ? `（${lastImportSummary.handoverNo}）` : ''}，差异 ${lastImportSummary.issues} 条保留本台`}
+          description={`导入时间 ${dayjs(lastImportSummary.time).format('YYYY-MM-DD HH:mm')}。如发现核对有误，可整体撤回到导入前状态。`}
+          action={
+            <Space>
+              <Button size="small" onClick={dismissRollback}>
+                忽略
+              </Button>
+              <Button size="small" icon={<RollbackOutlined />} onClick={handleRollback}>
+                撤回导入
+              </Button>
+            </Space>
+          }
+        />
+      ) : null}
+
+      {missingShelfBoxes.length > 0 ? (
+        <Alert
+          style={{ marginBottom: 12 }}
+          type="warning"
+          showIcon
+          message={`有 ${missingShelfBoxes.length} 个岩芯箱缺货架位，请补齐`}
+          description={
+            <span>
+              {missingShelfBoxes.slice(0, 8).map((b) => b.boxNo).join('、')}
+              {missingShelfBoxes.length > 8 ? ' 等' : ''}
+              。可在下方「库架位」列直接选择补齐。
+            </span>
+          }
+        />
+      ) : null}
 
       <Space style={{ marginBottom: 12 }} wrap>
         <span style={{ color: '#6b7a86' }}>当前钻孔</span>
@@ -212,6 +411,14 @@ export default function CoreBoxList() {
         <Button type="primary" onClick={openCreate} disabled={!activeHoleId}>
           新建岩芯箱
         </Button>
+        <Button icon={<ImportOutlined />} onClick={openImport}>
+          导入移交单
+        </Button>
+        {canRollback ? (
+          <Button icon={<RollbackOutlined />} onClick={handleRollback}>
+            撤回导入
+          </Button>
+        ) : null}
       </Space>
 
       {holeBoxes.length === 0 ? (
@@ -246,7 +453,7 @@ export default function CoreBoxList() {
           </Col>
           <Col xs={24}>
             <Card size="small" title="岩芯箱台账">
-              <Table rowKey="id" size="small" columns={columns} dataSource={holeBoxes} pagination={{ pageSize: 6 }} scroll={{ x: 1400 }} />
+              <Table rowKey="id" size="small" columns={columns} dataSource={holeBoxes} pagination={{ pageSize: 6 }} scroll={{ x: 1800 }} />
             </Card>
           </Col>
         </Row>
@@ -301,6 +508,122 @@ export default function CoreBoxList() {
             <Input.TextArea rows={2} maxLength={60} placeholder="岩芯缺失情况等" />
           </Form.Item>
         </Form>
+      </Modal>
+
+      {/* 导入库管员移交单 */}
+      <Modal
+        open={importOpen}
+        title="导入库管员移交单"
+        onCancel={() => setImportOpen(false)}
+        width={860}
+        footer={
+          <Space>
+            <Button onClick={() => setImportOpen(false)}>取消</Button>
+            <Button type="primary" loading={importing} disabled={!importResult || importResult.updates.length === 0} onClick={handleConfirmImport}>
+              确认导入（{importResult?.updates.length ?? 0} 条）
+            </Button>
+          </Space>
+        }
+      >
+        <Paragraph type="secondary" style={{ marginBottom: 8 }}>
+          粘贴库管员发来的箱位移交单（JSON 或带表头 CSV），按箱号与本台核对货架位与入架时间。箱子对不上、货架位重复或入架时间空着的保留本台，差异在下方列出。
+        </Paragraph>
+        <Space style={{ marginBottom: 8 }}>
+          <Button size="small" onClick={() => setImportText(HANDOVER_EXAMPLE)}>
+            填入示例
+          </Button>
+          <Button size="small" type="primary" ghost onClick={handleReconcile}>
+            核对
+          </Button>
+        </Space>
+        <Input.TextArea
+          rows={8}
+          value={importText}
+          onChange={(e) => setImportText(e.target.value)}
+          placeholder='{"handoverNo":"JY-...","items":[{"boxNo":"X-2402-01","shelfPos":"A 区 1 架","shelvedAt":"2026-09-20"}]}'
+          style={{ fontFamily: 'monospace', fontSize: 12 }}
+        />
+
+        {importResult ? (
+          <div style={{ marginTop: 12 }}>
+            <Alert
+              type={importResult.issues.length > 0 ? 'warning' : 'success'}
+              showIcon
+              message={`共 ${importResult.total} 条：可应用 ${importResult.updates.length} 条，差异 ${importResult.issues.length} 条（差异保留本台）`}
+              style={{ marginBottom: 8 }}
+            />
+            {importResult.issues.length > 0 ? (
+              <Card size="small" title="差异清单（保留本台，不应用）" style={{ marginBottom: 8 }}>
+                <Table
+                  rowKey={(r) => `${r.type}-${r.boxNo}-${r.shelfPos ?? ''}`}
+                  size="small"
+                  pagination={false}
+                  dataSource={importResult.issues}
+                  columns={[
+                    { title: '箱号', dataIndex: 'boxNo', width: 130, render: (v: string) => v || '—' },
+                    {
+                      title: '类型',
+                      dataIndex: 'type',
+                      width: 120,
+                      render: (t: keyof typeof RECONCILE_ISSUE_TEXT) => <Tag color="orange">{RECONCILE_ISSUE_TEXT[t]}</Tag>,
+                    },
+                    { title: '货架位', dataIndex: 'shelfPos', width: 130, render: (v?: string) => v || '—' },
+                    { title: '入架时间', dataIndex: 'shelvedAt', width: 110, render: (v?: string) => (v ? dayjs(v).format('YYYY-MM-DD') : '—') },
+                    { title: '说明', dataIndex: 'message' },
+                  ]}
+                />
+              </Card>
+            ) : null}
+            {importResult.updates.length > 0 ? (
+              <Card size="small" title="将应用的更新（按箱号匹配）">
+                <Table
+                  rowKey={(r) => r.box.id}
+                  size="small"
+                  pagination={false}
+                  dataSource={importResult.updates}
+                  columns={[
+                    { title: '箱号', dataIndex: ['box', 'boxNo'], width: 130, render: (v: string) => <Text strong>{v}</Text> },
+                    {
+                      title: '货架位',
+                      width: 160,
+                      render: (_, r) => (
+                        <span>
+                          {r.box.shelfPos || <Text type="secondary">未分配</Text>} → <Text type={r.shelfPosChanged ? 'warning' : undefined}>{r.shelfPos}</Text>
+                        </span>
+                      ),
+                    },
+                    {
+                      title: '入架时间',
+                      width: 180,
+                      render: (_, r) => (
+                        <span>
+                          {r.box.shelvedAt ? dayjs(r.box.shelvedAt).format('YYYY-MM-DD') : <Text type="secondary">未入架</Text>} →{' '}
+                          <Text type={r.shelvedAtChanged ? 'warning' : undefined}>{dayjs(r.shelvedAt).format('YYYY-MM-DD')}</Text>
+                        </span>
+                      ),
+                    },
+                    { title: '入架状态', width: 90, render: () => <Tag color="green">已入架</Tag> },
+                  ]}
+                />
+              </Card>
+            ) : null}
+          </div>
+        ) : null}
+      </Modal>
+
+      {/* 手动标记入架 */}
+      <Modal
+        open={!!shelveTarget}
+        title={`标记入架 · ${shelveTarget?.boxNo ?? ''}`}
+        onCancel={() => setShelveTarget(null)}
+        onOk={confirmShelve}
+        okText="确认入架"
+        cancelText="取消"
+      >
+        <Space>
+          <span>入架时间</span>
+          <DatePicker value={shelveDate} onChange={(d) => d && setShelveDate(d)} />
+        </Space>
       </Modal>
     </div>
   );
